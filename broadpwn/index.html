@@ -50,6 +50,8 @@ footer {
 
 <p>Broadpwn is a heap overflow on Broadcom Wi-Fi chips. It's triggered when a device receives a WME (Quality-of-Service) information element with a malformed length from a connected network. Scanning for networks without connecting doesn't seem to trigger the bug.</p>
 
+<p>According to @nitayart, who discovered the bug, connecting to a malicious network <a href="https://twitter.com/nitayart/status/883221981834997760">is not necessary</a>, but I haven't figured out how that would work.</p>
+
 <p>This supposedly affects many recent Android and iOS devices with Broadcom Wi-Fi, but I only experienced effects on a Nexus 6P with June 2017 firmware, and did not seem to affect any iOS devices I tested.</p>
 
 <p>To protect a device, you might want to ensure that it only connects to known good networks, and disable auto connection on unsecured networks.</p>
